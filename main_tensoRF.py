@@ -1,20 +1,28 @@
 import torch
 import argparse
 
-from nerf.provider import NeRFDataset
+from nerf.provider import NeRFDataset, NeRFDataset2
 from nerf.gui import NeRFGUI
 from tensoRF.utils import *
 
+from nerf import global_var as gl
+gl.__init()
 #torch.autograd.set_detect_anomaly(True)
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str)
+    parser.add_argument('--path_sem', type=str,default="/data/dmsr/bathroom/train/semantic",help="semantic labels")
     parser.add_argument('-O', action='store_true', help="equals --fp16 --cuda_ray --preload")
     parser.add_argument('--test', action='store_true', help="test mode")
     parser.add_argument('--workspace', type=str, default='workspace')
     parser.add_argument('--seed', type=int, default=0)
+    ####+++
+    parser.add_argument('--loss_ce', type=int, default=1)
+    parser.add_argument('--loss_mse', type=int, default=1)
+    ####+++
+    
     ### training options
     parser.add_argument('--iters', type=int, default=30000, help="training iters")
     parser.add_argument('--lr0', type=float, default=2e-2, help="initial learning rate for embeddings")
@@ -75,15 +83,26 @@ if __name__ == '__main__':
         assert opt.num_rays % (opt.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
 
     print(opt)
+    
     seed_everything(opt.seed)
-
+    
+    gl.set_value('loss_ce',opt.loss_ce)
+   
     if opt.cp:
         assert opt.bg_radius <= 0, "background model is not implemented for --cp"
         from tensoRF.network_cp import NeRFNetwork
     else:
         from tensoRF.network import NeRFNetwork
+    
 
-    model = NeRFNetwork(
+    criterion = torch.nn.MSELoss(reduction='none')
+    criterion2 = torch.nn.CrossEntropyLoss()
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if opt.test:
+        
+        model = NeRFNetwork(
         resolution=[opt.resolution0] * 3,
         bound=opt.bound,
         cuda_ray=opt.cuda_ray,
@@ -91,15 +110,8 @@ if __name__ == '__main__':
         min_near=opt.min_near,
         density_thresh=opt.density_thresh,
         bg_radius=opt.bg_radius,
-    )
-    
-    print(model)
-
-    criterion = torch.nn.MSELoss(reduction='none')
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    if opt.test:
+        num_class=num_class
+        )
 
         trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16, metrics=[PSNRMeter()], use_checkpoint=opt.ckpt)
 
@@ -108,26 +120,40 @@ if __name__ == '__main__':
             gui.render()
         
         else:
-            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+            test_loader = NeRFDataset2(opt, device=device, type='test').dataloader()
 
             if test_loader.has_gt:
                 trainer.evaluate(test_loader) # blender has gt, so evaluate it.
             
             trainer.test(test_loader, write_video=True) # test and save video
 
-            #trainer.save_mesh(resolution=256, threshold=0.1)
+            trainer.save_mesh(resolution=256, threshold=0.1)
     
     else:
 
         optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr0, opt.lr1), betas=(0.9, 0.99), eps=1e-15)
 
-        train_loader = NeRFDataset(opt, device=device, type='train').dataloader()
+        train_loader = NeRFDataset2(opt, device=device, type='train').dataloader()
 
+        
+        model = NeRFNetwork(
+        resolution=[opt.resolution0] * 3,
+        bound=opt.bound,
+        cuda_ray=opt.cuda_ray,
+        density_scale=1,
+        min_near=opt.min_near,
+        density_thresh=opt.density_thresh,
+        bg_radius=opt.bg_radius,
+        num_class=train_loader.num_class
+        )
+        gl.set_value('num_class',train_loader.num_class)
+        print(model)
         # decay to 0.1 * init_lr at last iter step
+        
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
-
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=None, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=[PSNRMeter()], use_checkpoint=opt.ckpt, eval_interval=50)
-
+        metrics = [PSNRMeter(), LPIPSMeter(device=device)]
+        #trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
+        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=[criterion,criterion2], ema_decay=None, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=[PSNRMeter()], use_checkpoint=opt.ckpt, eval_interval=50)
         # calc upsample target resolutions
         upsample_resolutions = (np.round(np.exp(np.linspace(np.log(opt.resolution0), np.log(opt.resolution1), len(opt.upsample_model_steps) + 1)))).astype(np.int32).tolist()[1:]
         print('upsample_resolutions:', upsample_resolutions)
@@ -138,17 +164,16 @@ if __name__ == '__main__':
             gui.render()
         
         else:
-            valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1).dataloader()
-
+            valid_loader = NeRFDataset2(opt, device=device, type='val', downscale=1,num_class=gl.get_value('num_class'),semantic_classes=train_loader.semantic_classes).dataloader()
             max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
             trainer.train(train_loader, valid_loader, max_epoch)
 
             # also test
-            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+            test_loader = NeRFDataset2(opt, device=device, type='test').dataloader()
             
             if test_loader.has_gt:
                 trainer.evaluate(test_loader) # blender has gt, so evaluate it.
             
             trainer.test(test_loader, write_video=True) # test and save video
 
-            #trainer.save_mesh(resolution=256, threshold=0.1)
+            trainer.save_mesh(resolution=256, threshold=0.1)

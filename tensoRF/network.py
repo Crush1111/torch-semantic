@@ -19,10 +19,13 @@ class NeRFNetwork(NeRFRenderer):
                  bg_rank=8,
                  color_feat_dim=27,
                  num_layers=3,
-                 hidden_dim=128,
+                 hidden_dim=138,
+                 num_layers_sem=3,
+                 hidden_dim_sem=138,
                  num_layers_bg=2,
                  hidden_dim_bg=64,
                  bound=1,
+                 num_class=150,
                  **kwargs
                  ):
         super().__init__(bound, **kwargs)
@@ -30,12 +33,12 @@ class NeRFNetwork(NeRFRenderer):
         self.resolution = resolution
 
         # vector-matrix decomposition
-        self.sigma_rank = sigma_rank
-        self.color_rank = color_rank
-        self.color_feat_dim = color_feat_dim
+        self.sigma_rank = sigma_rank #SVD (Singular Value Decomposition) 的rank,即分解后的矩阵的秩
+        self.color_rank = color_rank #颜色特征的维度大小
+        self.color_feat_dim = color_feat_dim #参数表示颜色特征的总维度大小
 
-        self.mat_ids = [[0, 1], [0, 2], [1, 2]]
-        self.vec_ids = [2, 1, 0]
+        self.mat_ids = [[0, 1], [0, 2], [1, 2]] #三个矩阵参数的索引，每个子列表 [mat_id_0, mat_id_1] 代表一个矩阵参数,其大小为 (resolution[mat_id_1], resolution[mat_id_0])
+        self.vec_ids = [2, 1, 0] #三个向量参数的索引，每个索引对应一个向量参数,其大小为 (resolution[vec_id], 1)。
 
         self.sigma_mat, self.sigma_vec = self.init_one_svd(self.sigma_rank, self.resolution)
         self.color_mat, self.color_vec = self.init_one_svd(self.color_rank, self.resolution)
@@ -45,8 +48,8 @@ class NeRFNetwork(NeRFRenderer):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
 
-        self.encoder, enc_dim = get_encoder('frequency', input_dim=color_feat_dim, multires=2)
-        self.encoder_dir, enc_dim_dir = get_encoder('frequency', input_dim=3, multires=2)
+        self.encoder, enc_dim = get_encoder('frequency', input_dim=color_feat_dim, multires=2)#编码颜色特征
+        self.encoder_dir, enc_dim_dir = get_encoder('frequency', input_dim=3, multires=2)#编码方向特征
 
         self.in_dim = enc_dim + enc_dim_dir
 
@@ -65,7 +68,27 @@ class NeRFNetwork(NeRFRenderer):
             color_net.append(nn.Linear(in_dim, out_dim, bias=False))
 
         self.color_net = nn.ModuleList(color_net)
+        #semantic network
+        
+        self.num_layers_sem = num_layers_sem        
+        self.hidden_dim_sem = hidden_dim_sem
+        
+        sem_net = []
+        for l in range(num_layers_sem):
+            if l == 0:
+                in_dim = in_dim
+            else:
+                in_dim = self.hidden_dim_sem
+            
+            if l == num_layers_sem - 1:
+                out_dim = num_class 
+            else:
+                out_dim = hidden_dim_sem
+            
+            sem_net.append(nn.Linear(in_dim, out_dim, bias=False))
 
+        self.sem_net = nn.ModuleList(sem_net)
+        
         # background model
         if self.bg_radius > 0:
             self.num_layers_bg = num_layers_bg        
@@ -96,10 +119,10 @@ class NeRFNetwork(NeRFRenderer):
             self.bg_net = None
 
 
-    def init_one_svd(self, n_component, resolution, scale=0.1):
+    def init_one_svd(self, n_component, resolution, scale=0.1):#用于初始化单个 SVD 模型的参数,包括矩阵参数和向量参数。这些参数可以在后续的训练过程中被优化和更新
 
         mat, vec = [], []
-
+        
         for i in range(len(self.vec_ids)):
             vec_id = self.vec_ids[i]
             mat_id_0, mat_id_1 = self.mat_ids[i]
@@ -172,15 +195,35 @@ class NeRFNetwork(NeRFRenderer):
         enc_d = self.encoder_dir(d)
 
         h = torch.cat([enc_color_feat, enc_d], dim=-1)
+        #color
+
         for l in range(self.num_layers):
-            h = self.color_net[l](h)
-            if l != self.num_layers - 1:
+            if l ==self.num_layers-1:
+                h = self.color_net[l](h)
+                h = torch.sigmoid(h)
+            else:
+                h = self.color_net[l](h)
                 h = F.relu(h, inplace=True)
         
-        # sigmoid activation for rgb
-        rgb = torch.sigmoid(h)
+        
+        fcolor = h
+        #sem
+        #enc_x = self.encoder_dir(x)
+        x = 2 * (x - self.aabb_train[:3]) / (self.aabb_train[3:] - self.aabb_train[:3]) - 1
+        s = torch.cat([enc_color_feat,x], dim=-1) #63
+        
+        for l in range(self.num_layers_sem):
+            if l ==self.num_layers_sem-1:
+                s = self.sem_net[l](s)
+                s = torch.softmax(s, dim=-1)
+            else:
+                s = self.sem_net[l](s)
+                s = F.relu(s, inplace=True)
+        fsem = s
 
-        return sigma, rgb
+   
+        
+        return sigma, fcolor, fsem
 
 
     def density(self, x):
@@ -254,7 +297,22 @@ class NeRFNetwork(NeRFRenderer):
 
         return rgbs
 
-
+    def semantic(self, x, **kwargs):
+        x = 2 * (x - self.aabb_train[:3]) / (self.aabb_train[3:] - self.aabb_train[:3]) - 1
+        color_feat = self.get_color_feat(x)
+        enc_color_feat = self.encoder(color_feat)
+        #enc_x = self.encoder_dir(x)
+        
+        s = torch.cat([enc_color_feat,x], dim=-1) #63
+        
+        for l in range(self.num_layers_sem):
+            if l == self.num_layers_sem-1 :
+                s = self.sem_net[l](s)
+                s = torch.softmax(s, dim=-1)
+            else:
+                s = self.sem_net[l](s)
+                s = F.relu(s, inplace=True)
+        return s
     # L1 penalty for loss
     def density_loss(self):
         loss = 0
@@ -317,6 +375,7 @@ class NeRFNetwork(NeRFRenderer):
         print(f'[INFO] shrink slice: {tl.cpu().numpy().tolist()} - {br.cpu().numpy().tolist()}')
         print(f'[INFO] new aabb: {self.aabb_train.cpu().numpy().tolist()}')
         
+
 
     # optimizer utils
     def get_params(self, lr1, lr2):

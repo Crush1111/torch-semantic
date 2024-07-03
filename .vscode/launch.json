@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+    {
+    "name": "Python: 当前文件",
+    "type": "python",
+    "request": "launch",
+    "program": "${workspaceFolder}/main_tensoRF.py",
+    "args": ["/root/autodl-tmp/data/bedroom/", "--workspace", "/root/autodl-tmp/data/result-test", "--path_sem", "/root/autodl-tmp/data/bedroom/semantic"],
+    "cwd": "${workspaceFolder}",
+    "console": "integratedTerminal"
+    }
+    ]
+}

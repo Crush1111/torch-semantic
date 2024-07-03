@@ -29,6 +29,7 @@ class NeRFNetwork(NeRFRenderer):
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
         self.encoder, self.in_dim = get_encoder(encoding, desired_resolution=2048 * bound)
+        
 
         sigma_net = []
         for l in range(num_layers):
